@@ -1,5 +1,14 @@
-# File: drumbrain-setup.sh
 #!/bin/bash
+# DrumBrain Pi Setup Script
+# - Installs JACK2, DrumGizmo, tools
+# - Downloads CrocellKit
+# - Configures systemd services:
+#     - drumbrain-jackd.service
+#     - drumbrain-drumgizmo.service
+#     - jack-plumbing.service
+# - Disables PipeWire/PulseAudio and sets realtime limits
+# - Targets user 'pi' on Raspberry Pi OS
+
 set -e
 
 # ------------------------------
@@ -22,7 +31,7 @@ print_step() {
   printf "[%2d/%2d] %-45s (%3d%% complete)\n" "$step" "$total" "$message" "$percent"
 }
 
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 CURRENT_STEP=0
 
 next_step() {
@@ -41,6 +50,11 @@ if [ "$(whoami)" != "pi" ]; then
   exit 1
 fi
 
+DRUMKIT_DIR="/home/pi/drumkits/CrocellKit_Stereo_MIX"
+DRUMKIT_XML="${DRUMKIT_DIR}/CrocellKit_full.xml"
+MIDIMAP_XML="${DRUMKIT_DIR}/Midimap_full.xml"
+CROCELL_URL="https://drumgizmo.org/kits/CrocellKit/CrocellKit1_1.zip"
+
 # ------------------------------
 #  STEP 1: Install packages
 # ------------------------------
@@ -51,19 +65,23 @@ sudo apt-get install -y \
   jackd2 \
   jack-tools \
   drumgizmo \
-  alsa-utils
+  alsa-utils \
+  wget \
+  unzip
 
 # ------------------------------
-#  STEP 2: Disable PipeWire / PulseAudio user services
+#  STEP 2: Disable PipeWire / PulseAudio services
 # ------------------------------
-next_step "Disabling PipeWire / WirePlumber / PulseAudio user services..."
+next_step "Disabling PipeWire / WirePlumber / PulseAudio services..."
 
-# Disable and stop PipeWire + WirePlumber + PipeWire-Pulse for user 'pi'
+# User-level services
 systemctl --user disable --now pipewire.service pipewire.socket wireplumber.service pipewire-pulse.service 2>/dev/null || true
 systemctl --user mask pipewire.service pipewire.socket wireplumber.service pipewire-pulse.service 2>/dev/null || true
-
-# Best-effort disable PulseAudio user services if present
 systemctl --user disable --now pulseaudio.service pulseaudio.socket 2>/dev/null || true
+
+# System-level services (best effort)
+sudo systemctl disable --now pipewire.service pipewire.socket wireplumber.service 2>/dev/null || true
+sudo systemctl mask pipewire.service pipewire.socket wireplumber.service 2>/dev/null || true
 
 # ------------------------------
 #  STEP 3: Ensure pi is in audio + realtime groups
@@ -79,14 +97,72 @@ sudo usermod -aG realtime pi || true
 next_step "Configuring realtime priority and memlock limits..."
 
 sudo tee /etc/security/limits.d/audio.conf >/dev/null <<'EOF'
-@audio   -  rtprio     95
-@audio   -  memlock    unlimited
-@realtime - rtprio     95
-@realtime - memlock    unlimited
+@audio    -  rtprio     95
+@audio    -  memlock    unlimited
+@realtime -  rtprio     95
+@realtime -  memlock    unlimited
 EOF
 
 # ------------------------------
-#  STEP 5: JACK start script
+#  STEP 5: Download + install Crocell kit
+# ------------------------------
+next_step "Downloading and installing CrocellKit (if needed)..."
+
+mkdir -p /home/pi/drumkits
+cd /home/pi/drumkits
+
+if [ -f "${DRUMKIT_XML}" ] && [ -f "${MIDIMAP_XML}" ]; then
+  echo "[kit] Crocell kit already present at ${DRUMKIT_DIR}."
+else
+  echo "[kit] Crocell kit not found, downloading from:"
+  echo "      ${CROCELL_URL}"
+
+  # Clean up any old temp zips
+  rm -f CrocellKit1_1.zip CrocellKit_Stereo_MIX.zip
+
+  # Download archive (your working URL)
+  wget -O CrocellKit1_1.zip "${CROCELL_URL}"
+
+  echo "[kit] Extracting archive..."
+  unzip -q CrocellKit1_1.zip
+
+  # Try to find a folder containing CrocellKit_full.xml
+  CANDIDATE_DIR=""
+  while IFS= read -r path; do
+    if [ -f "${path}/CrocellKit_full.xml" ]; then
+      CANDIDATE_DIR="${path}"
+      break
+    fi
+  done < <(find . -maxdepth 2 -type d)
+
+  if [ -z "${CANDIDATE_DIR}" ]; then
+    echo "[kit] ERROR: Could not find CrocellKit_full.xml after extraction."
+    echo "       Please inspect /home/pi/drumkits manually."
+    exit 1
+  fi
+
+  echo "[kit] Found kit directory: ${CANDIDATE_DIR}"
+
+  # Normalise directory name
+  rm -rf "${DRUMKIT_DIR}"
+  mv "${CANDIDATE_DIR}" "${DRUMKIT_DIR}"
+
+  # Clean up zip
+  rm -f CrocellKit1_1.zip
+
+  if [ -f "${DRUMKIT_XML}" ] && [ -f "${MIDIMAP_XML}" ]; then
+    echo "[kit] Crocell kit installed at: ${DRUMKIT_DIR}"
+  else
+    echo "[kit] WARNING: Kit or midimap XML still missing after move."
+    echo "       Expected:"
+    echo "         ${DRUMKIT_XML}"
+    echo "         ${MIDIMAP_XML}"
+    exit 1
+  fi
+fi
+
+# ------------------------------
+#  STEP 6: JACK start script
 # ------------------------------
 next_step "Creating /usr/local/bin/jackd_start.sh..."
 
@@ -99,7 +175,7 @@ echo "[jackd_start] Waiting for ALSA cards to appear..."
 # Wait up to ~10 seconds for ALSA to enumerate devices
 for i in {1..50}; do
     CARD_LIST=$(aplay -l 2>/dev/null || true)
-    if echo "${CARD_LIST}" | grep -qE 'USB Audio|USB Audio CODEC|Headphones'; then
+    if echo "${CARD_LIST}" | grep -qiE 'usb|umc|codec|audio|headphones'; then
         break
     fi
     sleep 0.2
@@ -110,8 +186,8 @@ CARD_LIST=$(aplay -l 2>/dev/null || true)
 echo "[jackd_start] ALSA card list:"
 echo "${CARD_LIST}"
 
-# Prefer USB audio interface (e.g. UMC22, “USB Audio CODEC”)
-USB_CARD_INDEX=$(printf "%s\n" "${CARD_LIST}" | awk '/USB Audio|USB Audio CODEC/ {print $2; exit}' | tr -d ':')
+# Prefer USB audio interface (UMC22 typically appears as 'USB Audio')
+USB_CARD_INDEX=$(printf "%s\n" "${CARD_LIST}" | awk 'BEGIN{IGNORECASE=1} /usb|umc|codec|audio/ {print $2; exit}' | tr -d ':')
 
 if [ -n "${USB_CARD_INDEX}" ]; then
   CARD_NAME="hw:${USB_CARD_INDEX}"
@@ -123,7 +199,7 @@ else
     CARD_NAME="hw:${HP_CARD_INDEX}"
     echo "[jackd_start] Using fallback Headphones device: ${CARD_NAME}"
   else
-    echo "[jackd_start] No suitable audio device found (no USB Audio / USB Audio CODEC / Headphones)." >&2
+    echo "[jackd_start] No suitable audio device found (no USB / Headphones)." >&2
     exit 1
   fi
 fi
@@ -135,7 +211,7 @@ EOF
 sudo chmod +x /usr/local/bin/jackd_start.sh
 
 # ------------------------------
-#  STEP 6: drumbrain-jackd.service
+#  STEP 7: drumbrain-jackd.service
 # ------------------------------
 next_step "Configuring systemd service drumbrain-jackd.service..."
 
@@ -160,13 +236,17 @@ WantedBy=multi-user.target
 EOF
 
 # ------------------------------
-#  STEP 7: DrumGizmo start script
+#  STEP 8: DrumGizmo start script
 # ------------------------------
 next_step "Creating /usr/local/bin/drumbrain_start.sh..."
 
 sudo tee /usr/local/bin/drumbrain_start.sh >/dev/null <<'EOF'
 #!/bin/bash
 set -e
+
+DRUMKIT_DIR="/home/pi/drumkits/CrocellKit_Stereo_MIX"
+DRUMKIT_XML="${DRUMKIT_DIR}/CrocellKit_full.xml"
+MIDIMAP_XML="${DRUMKIT_DIR}/Midimap_full.xml"
 
 echo "[drumbrain_start] Waiting for JACK..."
 
@@ -185,19 +265,27 @@ if ! /usr/bin/jack_lsp 2>/dev/null | grep -q "system:playback_1"; then
     exit 1
 fi
 
-DRUMKIT_DIR="/home/pi/drumkits/CrocellKit_Stereo_MIX"
-KIT_XML="${DRUMKIT_DIR}/CrocellKit_full.xml"
-MIDIMAP_XML="${DRUMKIT_DIR}/Midimap_full.xml"
+if [ ! -f "${DRUMKIT_XML}" ]; then
+    echo "[drumbrain_start] ERROR: Kit XML not found at: ${DRUMKIT_XML}" >&2
+    exit 1
+fi
 
-echo "[drumbrain_start] Starting DrumGizmo with kit: ${KIT_XML} and midimap: ${MIDIMAP_XML}"
+if [ ! -f "${MIDIMAP_XML}" ]; then
+    echo "[drumbrain_start] ERROR: Midimap XML not found at: ${MIDIMAP_XML}" >&2
+    exit 1
+fi
 
-/usr/bin/drumgizmo -i jackmidi -I midimap="${MIDIMAP_XML}" -o jackaudio "${KIT_XML}"
+echo "[drumbrain_start] Starting DrumGizmo with:"
+echo "  KIT:     ${DRUMKIT_XML}"
+echo "  MIDIMAP: ${MIDIMAP_XML}"
+
+/usr/bin/drumgizmo -i jackmidi -I midimap="${MIDIMAP_XML}" -o jackaudio "${DRUMKIT_XML}"
 EOF
 
 sudo chmod +x /usr/local/bin/drumbrain_start.sh
 
 # ------------------------------
-#  STEP 8: drumbrain-drumgizmo.service
+#  STEP 9: drumbrain-drumgizmo.service
 # ------------------------------
 next_step "Configuring systemd service drumbrain-drumgizmo.service..."
 
@@ -206,7 +294,6 @@ sudo tee /etc/systemd/system/drumbrain-drumgizmo.service >/dev/null <<'EOF'
 Description=DrumBrain DrumGizmo Engine
 After=drumbrain-jackd.service
 Requires=drumbrain-jackd.service
-# Only start if the kit XML exists
 ConditionPathExists=/home/pi/drumkits/CrocellKit_Stereo_MIX/CrocellKit_full.xml
 
 [Service]
@@ -223,7 +310,7 @@ WantedBy=multi-user.target
 EOF
 
 # ------------------------------
-#  STEP 9: JACK plumbing (auto-connect)
+#  STEP 10: JACK plumbing (auto-connect)
 # ------------------------------
 next_step "Creating JACK plumbing rules and service..."
 
@@ -236,8 +323,8 @@ EOF
 sudo tee /etc/systemd/system/jack-plumbing.service >/dev/null <<'EOF'
 [Unit]
 Description=JACK Plumbing Autoconnect
-After=drumbrain-jackd.service
-Requires=drumbrain-jackd.service
+After=drumbrain-drumgizmo.service
+Requires=drumbrain-drumgizmo.service
 
 [Service]
 Type=simple
@@ -264,12 +351,10 @@ echo "  DrumBrain setup complete (100% done)  "
 echo "════════════════════════════════════════"
 echo
 echo "Next steps:"
-echo "  1) Ensure your drumkit files exist at:"
-echo "       /home/pi/drumkits/CrocellKit_Stereo_MIX/CrocellKit_full.xml"
-echo "       /home/pi/drumkits/CrocellKit_Stereo_MIX/Midimap_full.xml"
-echo "  2) Reboot the Pi:"
+echo "  1) Reboot the Pi:"
 echo "       sudo reboot"
-echo "  3) After reboot, check status from SSH:"
+echo
+echo "  2) After reboot, check status from SSH:"
 echo "       systemctl status drumbrain-jackd"
 echo "       systemctl status jack-plumbing"
 echo "       systemctl status drumbrain-drumgizmo"
