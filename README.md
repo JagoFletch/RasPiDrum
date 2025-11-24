@@ -8,7 +8,7 @@
 #### On a fresh installation of Raspberry Pi Os  
 ```
 cd ~
-wget https://raw.githubusercontent.com/<your-user>/<your-repo>/main/drumbrain-setup.sh
+wget https://raw.githubusercontent.com/JagoFletch/RasPiDrum/main/drumbrain-setup.sh
 chmod +x drumbrain-setup.sh
 ./drumbrain-setup.sh
 sudo reboot
